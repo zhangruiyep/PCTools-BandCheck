@@ -1,0 +1,1 @@
+pyinstaller --onefile -n FlashImgGen gui.py
