@@ -1,1 +1,1 @@
-pyinstaller --onefile -n FlashImgGen gui.py
+pyinstaller --onefile -n AT_BAND_Check gui.py

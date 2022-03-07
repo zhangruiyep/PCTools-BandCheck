@@ -1,336 +1,212 @@
+import os
 import tkinter as tk
 import tkinter.filedialog
 import tkinter.messagebox
-import os
-import tkinter.ttk
+import tkinter.font
+import tkinter.ttk as ttk
 import types
-import datetime
-import cfg
-import csvop
-import flashImage
+import serial.tools.list_ports
+import threading
+import time
 
+from mcuDevice import *
+from enum import Enum
 
-class filesData():
-	def __init__(self, filename="data.csv"):
-		self.filename = filename
-		self.data = csvop.readDataFile(filename)
-		self.map = cfg.configFile("map.ini")
-		
-	def getIdxByName(self, filename):
-		# get index by name
-		basename = os.path.basename(filename)
-		#print(basename)
-		try:
-			idx = int(basename[4:6])
-		except:
-			tkinter.messagebox.showerror("Invalid", "File Name Invalid: " + basename)
-			return -1
-		
-		if idx < 1 or idx > 18 or (idx > 14 and idx < 18):
-			tkinter.messagebox.showerror("Invalid", "File Index Invalid: " + basename)
-			return -1
-		
-		return idx
+class devState(Enum):
+	IDLE = 1
+	CONNECT = 2
+	TEST = 3
 
-	def getOffsetByName(self,filename):
-		idx = self.getIdxByName(filename)
-		#print(idx)
-		off = int(self.map.cp["FlashMap"][str(idx)], 16)
-		#print(off)
-		return off
-	
-	def isExist(self, filename):
-		idx = self.getIdxByName(filename)
-		for f in self.data:
-			if self.getIdxByName(f[0]) == idx:
-				return True
-		return False
-	
-	def idxValid(self, filename):
-		idx = self.getIdxByName(filename)
-		if idx < 0:
-			return False
-		return True
-	
-	def write(self):
-		csvop.writeDataFile(self.data, self.filename)
-	
-	def getLen(self):
-		return len(self.data)
-	
-
-class AddFrame(tkinter.ttk.Frame):
-	def __init__(self, master=None, parentIdx=""):
-		tkinter.ttk.Frame.__init__(self, master)
-		self.grid()
-		self.tv = master
-		self.parentIdx = parentIdx
-		self.createWidgets()
-		self.files = ()
-		
-	def createWidgets(self):
-		dataframe = tkinter.ttk.Frame(self)
-		dataframe.grid(row = 0, pady=3)
-		
-		label = tkinter.ttk.Label(dataframe, text="File(s):", justify=tk.LEFT)
-		label.grid(row=0, sticky=tk.E, padx=6, pady=3)
-
-		self.fileEntry = tkinter.ttk.Entry(dataframe)
-		self.fileEntry.delete(0, tk.END)
-		self.fileEntry.grid(row=0, column=1, padx=6, pady=3)		
-
-		self.getFileBtn = tkinter.ttk.Button(dataframe, text="Choose", command=self.chooseFile, width=10)
-		self.getFileBtn.grid(row=0, column=2, padx=6, pady=3)
-
-		btnframe = tkinter.ttk.Frame(self)
-		btnframe.grid(row = 1, pady=3)
-		
-		OKBtn = tkinter.ttk.Button(btnframe, text="OK", command=self.addRecord)
-		OKBtn.grid(row=0, padx=6)
-		CancelBtn = tkinter.ttk.Button(btnframe, text="Cancel", command=self.cancelAdd)
-		CancelBtn.grid(row=0, column=1, padx=6)
-
-	def addRecord(self):
-		filenames = self.files
-		count = len(filenames)
-		for i in range(0, count):
-			filename = filenames[i]
-			#print(filename)
-			if not os.path.exists(filename):
-				tkinter.messagebox.showwarning("Warning", "%s File not found" % filename)
-				return
-		
-			self.tv.update_filesdata()
-		
-			if not self.tv.filesdata.idxValid(filename):
-				self.destroy()
-				return
-
-			if self.tv.filesdata.isExist(filename):
-				tkinter.messagebox.showerror("Error", "File %s index exist already!" % filename)
-				self.destroy()
-				return
-		
-			self.tv.insert(self.parentIdx, "end", values=(filename,))
-
-		self.tv.update_filesdata()
-
-		self.destroy()
-
-	def cancelAdd(self):
-		self.destroy()
-		
-	def chooseFile(self):
-		filenames = tkinter.filedialog.askopenfilenames()
-		#print(filenames)
-		self.files = filenames
-		self.fileEntry.delete(0, tk.END)
-		for filename in filenames:
-			if (filenames != None) and (filenames != ""):
-				self.fileEntry.insert(tk.END, os.path.realpath(filename) + ",")
-
-def takeOffset(elem):
-	return elem[1]
-
-class filesTreeview(tkinter.ttk.Treeview):
+class Application(ttk.Frame):
 	def __init__(self, master=None):
-		tkinter.ttk.Treeview.__init__(self, master)
-		self['columns']=("filename")
-		self.filesdata = filesData()
-		self.grid(sticky=tk.NSEW)
-		self.createWidgets()
-	
-	def createWidgets(self):
-		self.column("#0", width=20, stretch=0)
-		self.column("filename", width=500)
-		self.heading('filename', text='File Name')
-		
-	def fill_treeview(self):
-		for item in self.get_children():
-			self.delete(item)
-			
-		for f in self.filesdata.data:
-			self.insert('',"end",values=(f[0],))
-	
-	def update_filesdata(self):
-		self.filesdata.data = []
-		for i in self.get_children():
-			off = self.filesdata.getOffsetByName(self.item(i)["values"][0])
-			if off != -1:
-				self.filesdata.data.append([self.item(i)["values"][0], off])
-		self.filesdata.data.sort(key=takeOffset)
-		self.fill_treeview()
-	
-		
-					
-class Application(tkinter.ttk.Frame):
-	def __init__(self, master=None):
-		tkinter.ttk.Frame.__init__(self, master) 
-		self.cfg = cfg.configFile()
+		ttk.Frame.__init__(self, master)
+		self.devCount = 1
 		self.columnconfigure(0, weight=1)
 		self.rowconfigure(1, weight=1)
-		self.grid(sticky=tk.NSEW) 
+		self.grid(sticky=tk.NSEW)
+		self.devList = []
 		self.createWidgets()
+		self.dev = None
+		self.stopAll = False
+
+		self.defaultFont = tkinter.font.nametofont("TkDefaultFont")
+		self.defaultFont.configure(family="微软雅黑",     size=16)
+
+
+	def initSerialFrame(self,frame):
+		frame.dev = None
+		frame.state = devState.IDLE
+		frame.passCount = 0
+
+		frame.InfoLable = ttk.Label(frame, text="端口号:", justify=tk.LEFT)
+		frame.InfoLable.grid(row=0, sticky=tk.W, padx=10)
+
+		frame.optionList = ["", ]
+		for port in serial.tools.list_ports.comports():
+			#print(port.description)
+			frame.optionList.append(port.description)
 		
+		frame.v = tk.StringVar()
+		#if len(frame.optionList) > 1:
+		#	frame.v.set(frame.optionList[0])
+		for op in frame.optionList:
+			if op.find("ASR Modem Device") >= 0 and op.find("ASR Modem Device 2") < 0:
+				frame.v.set(op)
+
+		frame.platformOpt = ttk.OptionMenu(frame, frame.v, *frame.optionList)
+		frame.platformOpt.grid(row = 0, column=1, sticky=tk.W, padx=10)
+
+		frame.conState = ttk.Label(frame, text="未连接", justify=tk.LEFT, background='gray', foreground='white')
+		frame.conState.grid(row = 0, column=2, sticky=tk.W, padx=10)
+
+		frame.testState = ttk.Label(frame, text="未测试", justify=tk.LEFT, background='gray', foreground='white')
+		frame.testState.grid(row = 0, column=3, sticky=tk.W, padx=10)
+
+		#frame.thread = threading.Thread(target=self.testThread, name="Thread-AT", args=(), daemon=True)
+		#frame.thread.start()
+
 	def createWidgets(self):
-		tv_frame = tkinter.ttk.Frame(self)
-		tv_frame.grid(row = 2, sticky=tk.NSEW, pady = 3)
-		
-		self.tv = filesTreeview(tv_frame)
-		self.tv.grid(row = 0, sticky=tk.NSEW)
-		self.tv.fill_treeview()
-				
-		self.sb = tkinter.ttk.Scrollbar(tv_frame, orient=tk.VERTICAL, command=self.tv.yview)
-		self.sb.grid(row = 0, column=1, sticky=tk.NS)
-		
-		self.tv.configure(yscrollcommand=self.sb.set)
+		help_frame = ttk.Frame(self)
+		help_frame.grid(row = 0, sticky=tk.NSEW, pady = 3)
+		help_frame.InfoLable = ttk.Label(help_frame, text="使用说明：\n1、将设备连接到电脑。\n2、点击“刷新”，工具自动识别端口号。\n3、点击“开始”。\n4、设备对应的状态显示“通过”或“失败”后，拔掉设备。\n重复以上1~4步", justify=tk.LEFT)
+		help_frame.InfoLable.grid(row=0, sticky=tk.W, padx=10)
 
-		self.context_menu = tk.Menu(self.tv, tearoff=0)
-		self.context_menu.add_command(label="Add", command=self.add_handler)
-		self.context_menu.add_command(label="Delete", command=self.delete_handler)
-		self.tv.bind('<3>', self.show_context_menu)
-		self.entryPopup = ""
-		self.record_frame = ""
+		for i in range(1,self.devCount+1):
+			serial_frame = ttk.Frame(self)
+			serial_frame.grid(row = i, sticky=tk.NSEW, pady = 3)
 
-		output_frame = tkinter.ttk.Frame(self)
-		output_frame.grid(row = 0, sticky=tk.NSEW, pady = 3)
-		
-		self.Info = tkinter.ttk.Label(output_frame, text="Output file:", justify=tk.LEFT)
-		self.Info.grid(row=0, sticky=tk.W, padx=10)
-		
-		self.outputFilePathEntry = tkinter.ttk.Entry(output_frame, width = 40)
-		self.outputFilePathEntry.grid(row=0, column=1, padx=10)
-		if self.cfg:
-			try:
-				self.outputFilePathEntry.delete(0, tk.END)
-				self.outputFilePathEntry.insert(0, self.cfg.cp['OutFile']['Name'])
-			except:
-				print("can not get file name from cfg")
+			self.initSerialFrame(serial_frame)
+			self.devList.append(serial_frame)
 
-		self.getFileBtn = tkinter.ttk.Button(output_frame, text="Choose", command=self.chooseOutputFile, width=10)
-		self.getFileBtn.grid(row=0, column=2, padx=10)
-		
-		flashOptionFrame = tkinter.ttk.Frame(self)
-		flashOptionFrame.grid(row = 1, sticky=tk.NSEW, pady=3)
-		
-		self.flashSizeInfo = tkinter.ttk.Label(flashOptionFrame, text="Flash size(MB):", justify=tk.LEFT)
-		self.flashSizeInfo.grid(row = 0, sticky=tk.W, padx=10)
+		#print(self.devList)
 
-		optionList = ["", "8", "4", "2", "1"]
-		self.v = tk.StringVar()
-		self.v.set(optionList[1])
-		if self.cfg:
-			try:
-				self.v.set(self.cfg.cp['OutFile']['Size'])
-			except:
-				print("can not get file size from cfg")
-			
-		self.platformOpt = tkinter.ttk.OptionMenu(flashOptionFrame, self.v, *optionList)
-		self.platformOpt.grid(row = 0, column=1, sticky=tk.W, padx=10)
+		actionFrame = ttk.Frame(self)
+		actionFrame.grid(row = self.devCount+1, sticky=tk.NSEW, pady=3)
 
-		progressFrame = tkinter.ttk.Frame(self)
-		progressFrame.grid(row = 3, sticky=tk.NSEW, pady=3)
-		
-		self.pbar = tkinter.ttk.Progressbar(progressFrame,orient ="horizontal",length = 500, mode ="determinate")
-		self.pbar.grid(padx=10, sticky=tk.NSEW)
-		self.pbar["maximum"] = 100
+		self.startBtn = ttk.Button(actionFrame, text="开始", command=self.startTest)
+		self.startBtn.grid(padx=10, row = 0, column = 0)
+		self.refreshBtn = ttk.Button(actionFrame, text="刷新", command=self.refresh)
+		self.refreshBtn.grid(padx=10, row = 0, column = 1)
 
-		actionFrame = tkinter.ttk.Frame(self)
-		actionFrame.grid(row = 4, sticky=tk.NSEW, pady=3)
-		
-		self.genOutFileBtn = tkinter.ttk.Button(actionFrame, text="Generate Flash Image", command=self.genOutFile)
-		self.genOutFileBtn.grid(padx=10, row = 0, column = 0)
+	def testThread(self, idx):
+		frame = self.devList[idx]
+		while True:
+			if (self.stopAll):
+				break
 
-		self.saveCfgFileBtn = tkinter.ttk.Button(actionFrame, text="Save Configuration", command=self.saveCfgFile)
-		self.saveCfgFileBtn.grid(padx=10, row = 0, column = 1)		
+			option = frame.v.get()
+			#print(option)
 
-	def show_context_menu(self, event):
-		self.context_menu.post(event.x_root,event.y_root)
-		self.event = event
- 
+			comNum = None
+			for port in serial.tools.list_ports.comports():
+				if (port.description == option):
+					comNum = port.device
+					break
 
-	def delete_handler(self):
-		# close previous popups
-		if self.entryPopup:
-			self.entryPopup.destroy()
-			
-		self.edit_row = self.tv.identify_row(self.event.y)
-		
-		self.tv.focus(self.edit_row)
-		
-		item = self.tv.focus()
-		if item != '':
-			self.tv.delete(item)
+			if (comNum == None):
+				#print("no device")
+				frame.conState["text"] = "未连接"
+				frame.conState["background"] = "gray"
+				if (frame.state == devState.TEST):
+					frame.testState["text"] = "失败"
+					frame.testState["background"] = "red"
+					frame.passCount = 0
+					if (frame.dev):
+						frame.dev.close()
+					frame.dev = None
+					frame.state = devState.IDLE
+					break
+				continue
 
-		
-	def add_handler(self):
-		if self.entryPopup:
-			self.entryPopup.destroy()
+			print(comNum)
 
-		self.edit_row = self.tv.identify_row(self.event.y)
-		self.edit_column = self.tv.identify_column(self.event.x)
-		
-		parent = self.tv.parent(self.edit_row)
-		self.addDataFrame(parent)
-		
-	def addDataFrame(self, parentItem):
-		#x,y,width,height = self.tv.bbox(parentItem)
-		
-		if self.record_frame:
-			self.record_frame.destroy()
+			if (frame.dev == None):
+				frame.dev = mcuDevice(comNum, 10)
+				ret = frame.dev.open()
+				if (ret.result != "OK"):
+					#tkinter.messagebox.showerror(ret.result, ret.msg)
+					print("open %s fail" % comNum)
+					frame.conState["text"] = "未连接"
+					frame.conState["background"] = "gray"
+					frame.dev = None
+					time.sleep(1)
+					continue
+				else:
+					frame.state = devState.CONNECT
 
-		self.record_frame = AddFrame(self.tv, parentItem)
-		self.record_frame.place(x=0, y=20, anchor=tk.NW)						
-			
-	def chooseOutputFile(self):
-		filename = tkinter.filedialog.asksaveasfilename()
-		if (filename != None) and (filename != ""):
-			self.outputFilePathEntry.delete(0, tk.END)
-			self.outputFilePathEntry.insert(0, os.path.realpath(filename))
-	
-	def genOutFile(self):
-		outputFile = self.outputFilePathEntry.get().strip()
-		if not outputFile:
-			tkinter.messagebox.showwarning("Warning", "Output file not set")
+			if (frame.state == devState.CONNECT):
+				ret = frame.dev.runCmd(b'AT*BAND=0\r\n')
+				if (ret.result == "OK"):
+					frame.state = devState.TEST
+					frame.conState["text"] = "已连接"
+					frame.conState["background"] = "green"
+					frame.testState["text"] = "测试中"
+					frame.testState["background"] = "gray"
+				else:
+					frame.dev.close()
+					frame.dev = None
+					frame.state = devState.IDLE
+
+			elif (frame.state == devState.TEST):
+				ret = frame.dev.runCmd(b'AT*BAND?\r\n')
+				if (ret.result == "OK"):
+					frame.passCount += 1
+					if (frame.passCount > 15):
+						frame.testState["text"] = "通过"
+						frame.testState["background"] = "green"
+						ret = frame.dev.runCmd(b'AT*BAND=8\r\n')
+						if (ret.result != "OK"):
+							tkinter.messagebox.showerror("ERROR", "%s 恢复BAND失败，请检查设备设置是否正确！")
+						frame.passCount = 0
+						frame.dev.close()
+						frame.dev = None
+						break
+				else:
+					if (frame.passCount <= 15):
+						frame.testState["text"] = "失败"
+						frame.testState["background"] = "red"
+						frame.passCount = 0
+						frame.dev.close()
+						frame.dev = None
+						break
+
+			time.sleep(1)
+
+	def startTest(self):
+		self.stopAll = False
+		if (self.findDupDevs()):
+			tkinter.messagebox.showerror("ERROR", "设备端口重复，请检查！")
 			return
-		
-		outputSizeMB = self.v.get()
-		outputSize = int(outputSizeMB)*1024*1024
-		
-		self.tv.update_filesdata()
-		
-		if self.tv.filesdata.getLen() != 15:
-			tkinter.messagebox.showwarning("Warning", "There should be 15 files, please check it.")			
-		
-		img = flashImage.flashImage(outputFile, outputSize, self.tv.filesdata.data, self.updateProgress)
-		retval = img.writeFile()
-		if (retval.result == "Error"):
-			tkinter.messagebox.showerror(retval.result, retval.msg)
-		else:
-			tkinter.messagebox.showinfo("Info", retval.msg)
-		
-	def saveCfgFile(self):
-		try:
-			self.cfg.cp.add_section("OutFile")
-		except:
-			print("section exist")
-		outFileName = self.outputFilePathEntry.get().strip()
-		self.cfg.cp['OutFile']['Name'] = outFileName
-		self.cfg.cp['OutFile']['Size'] = self.v.get()
-		self.cfg.write()
 
-		self.tv.update_filesdata()
-		self.tv.filesdata.write()
+		for frame in self.devList:
+			idx = self.devList.index(frame)
+			frame.thread = threading.Thread(target=self.testThread, name="Thread-AT", args=(idx,), daemon=True)
+			frame.thread.start()
 
-		return
-	
-	def updateProgress(self, value):
-		self.pbar["value"] = int(value * self.pbar["maximum"])
-		#print("Progress %f" % value)
-		self.update_idletasks()
+	def refresh(self):
+		self.stopAll = True
+		self.devList.clear()
+		for i in range(1,self.devCount+1):
+			serial_frame = ttk.Frame(self)
+			serial_frame.grid(row = i, sticky=tk.NSEW, pady = 3)
 
-app = Application() 
-app.master.title('FlashImgGen V2.2') 
+			self.initSerialFrame(serial_frame)
+			self.devList.append(serial_frame)
+
+	def findDupDevs(self):
+		for frame_a in self.devList:
+			for frame_b in self.devList:
+				if (frame_a == frame_b):
+					continue
+				if (len(frame_a.v.get()) < 1) or (len(frame_b.v.get()) < 1):
+					continue
+				if (frame_a.v.get() == frame_b.v.get()):
+					print("COM ERROR:",frame_a.v.get())
+					return True
+		return False
+
+app = Application()
+app.master.title('BAND检测工具 V1.6')
 app.master.rowconfigure(0, weight=1)
 app.master.columnconfigure(0, weight=1)
-app.mainloop() 
+app.mainloop()
